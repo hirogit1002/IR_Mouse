@@ -14,11 +14,23 @@
 #define REMOTE_ADDRESS 0x00007201
 
 // NECext コマンド
-#define CMD_OK     0x0000A05F
-#define CMD_UP     0x0000FC03
-#define CMD_DOWN   0x0000A15E
-#define CMD_RIGHT  0x0000BF40
-#define CMD_LEFT   0x0000FD02
+#define CMD_OK          0x0000A05F
+#define CMD_UP          0x0000FC03
+#define CMD_DOWN        0x0000A15E
+#define CMD_RIGHT       0x0000BF40
+#define CMD_LEFT        0x0000FD02
+
+#define CMD_ALT_UP      0x0000E01F
+#define CMD_ALT_DOWN    0x0000E817
+#define CMD_ALT_RIGHT   0x0000AB54
+#define CMD_ALT_LEFT    0x0000E916
+#define CMD_RIGHT_DOWN  0x0000AF50
+#define CMD_RIGHT_UP    0x0000A758
+#define CMD_LEFT_DOWN   0x0000ED12
+#define CMD_LEFT_UP     0x0000E51A
+#define CMD_RIGHT_CLICK 0x0000B34C
+#define CMD_LEFT_CLICK  0x0000E41B
+
 
 // マウス速度
 #define MOUSE_SPEED_MIN 4
@@ -179,30 +191,63 @@ static void ir_received(
     switch(msg->command) {
 
     case CMD_UP:
+    case CMD_ALT_UP:
 
         furi_hal_hid_mouse_move(0, -(int8_t)speed);
 
         break;
 
     case CMD_DOWN:
+    case CMD_ALT_DOWN:
 
         furi_hal_hid_mouse_move(0, (int8_t)speed);
 
         break;
 
     case CMD_LEFT:
+    case CMD_ALT_LEFT:
 
         furi_hal_hid_mouse_move(-(int8_t)speed, 0);
 
         break;
 
     case CMD_RIGHT:
+    case CMD_ALT_RIGHT:
 
         furi_hal_hid_mouse_move((int8_t)speed, 0);
 
         break;
 
+
+    case CMD_RIGHT_DOWN:
+
+        furi_hal_hid_mouse_move((int8_t)speed, (int8_t)speed);
+
+        break;
+
+    
+    case CMD_RIGHT_UP:
+
+        furi_hal_hid_mouse_move((int8_t)speed, -(int8_t)speed);
+
+        break;
+
+
+    case CMD_LEFT_DOWN:
+
+        furi_hal_hid_mouse_move(-(int8_t)speed, (int8_t)speed);
+
+        break;
+
+    
+    case CMD_LEFT_UP:
+
+        furi_hal_hid_mouse_move(-(int8_t)speed, -(int8_t)speed);
+
+        break;
+
     case CMD_OK:
+    case CMD_LEFT_CLICK:
 
         // リピート信号ではクリックしない
         if(!msg->repeat) {
