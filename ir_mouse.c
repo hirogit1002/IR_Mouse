@@ -24,32 +24,66 @@
 #define CMD_ALT_DOWN    0x0000E817
 #define CMD_ALT_RIGHT   0x0000AB54
 #define CMD_ALT_LEFT    0x0000E916
+
 #define CMD_RIGHT_DOWN  0x0000AF50
 #define CMD_RIGHT_UP    0x0000A758
 #define CMD_LEFT_DOWN   0x0000ED12
 #define CMD_LEFT_UP     0x0000E51A
+
 #define CMD_RIGHT_CLICK 0x0000B34C
 #define CMD_LEFT_CLICK  0x0000E41B
 
+#define CMD_SCR_UP      0x0000B748
+#define CMD_SCR_DOWN    0x0000BB44
 
-// マウス速度
-#define MOUSE_SPEED_MIN 4
-#define MOUSE_SPEED_MAX 24
-#define MOUSE_SPEED_STEP 4
-#define MOUSE_SPEED_DEFAULT 12
+// 基本マウス速度
+#define MOUSE_SPEED_MIN      4
+#define MOUSE_SPEED_MAX      24
+#define MOUSE_SPEED_STEP     4
+#define MOUSE_SPEED_DEFAULT  12
 
+// 加速設定
+#define MOUSE_ACCEL_STEP     4
+#define MOUSE_ACCEL_MAX      48
+
+// 方向識別子
+#define DIR_NONE   0
+#define DIR_UP     1
+#define DIR_DOWN   2
+#define DIR_LEFT   3
+#define DIR_RIGHT  4
+#define DIR_RD     5
+#define DIR_RU     6
+#define DIR_LD     7
+#define DIR_LU     8
+
+
+// ========================================
 // アプリ状態
+// ========================================
+
 typedef struct {
     volatile bool running;
+
+    // ユーザーが設定する基本速度
     volatile uint8_t mouse_speed;
+
+    // 加速処理用
+    uint8_t accelerated_speed;
+    uint8_t last_direction;
+
 } IRMouseApp;
 
+
+// ========================================
 // USB HID設定
+// ========================================
+
 static const FuriHalUsbHidConfig hid_config = {
     .vid = 0x0483,
     .pid = 0x5740,
     .manuf = "Flipper Devices Inc.",
-    .product = "Flipper IR Mouse",
+    .product = "Flipper IR Mouse v3.0",
 };
 
 
@@ -66,7 +100,7 @@ static void ir_mouse_draw_callback(
     canvas_clear(canvas);
 
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 12, 12, "IR Mouse Active");
+    canvas_draw_str(canvas, 12, 12, "IR Mouse v3.0");
 
     canvas_set_font(canvas, FontSecondary);
 
@@ -81,13 +115,13 @@ static void ir_mouse_draw_callback(
         app->mouse_speed
     );
 
-    canvas_draw_str(canvas, 5, 39, speed_text);
+    canvas_draw_str(canvas, 5, 38, speed_text);
 
-    canvas_draw_str(canvas, 5, 51, "LEFT: Slower");
+    canvas_draw_str(canvas, 5, 49, "Hold: Accelerates");
 
-    canvas_draw_str(canvas, 5, 62, "RIGHT: Faster");
+    canvas_draw_str(canvas, 5, 59, "LEFT: Slower");
 
-    // BACKキーは終了操作
+    canvas_draw_str(canvas, 5, 67, "RIGHT: Faster");
 }
 
 
@@ -150,6 +184,102 @@ static void ir_mouse_input_callback(
 
 
 // ========================================
+// 方向コマンド判定
+// ========================================
+
+static bool ir_mouse_get_direction(
+    uint32_t command,
+    int8_t* dx,
+    int8_t* dy,
+    uint8_t* direction) {
+
+    *dx = 0;
+    *dy = 0;
+
+    switch(command) {
+
+    // 上
+    case CMD_UP:
+    case CMD_ALT_UP:
+
+        *dy = -1;
+        *direction = DIR_UP;
+
+        return true;
+
+    // 下
+    case CMD_DOWN:
+    case CMD_ALT_DOWN:
+
+        *dy = 1;
+        *direction = DIR_DOWN;
+
+        return true;
+
+    // 左
+    case CMD_LEFT:
+    case CMD_ALT_LEFT:
+
+        *dx = -1;
+        *direction = DIR_LEFT;
+
+        return true;
+
+    // 右
+    case CMD_RIGHT:
+    case CMD_ALT_RIGHT:
+
+        *dx = 1;
+        *direction = DIR_RIGHT;
+
+        return true;
+
+    // 右下
+    case CMD_RIGHT_DOWN:
+
+        *dx = 1;
+        *dy = 1;
+        *direction = DIR_RD;
+
+        return true;
+
+    // 右上
+    case CMD_RIGHT_UP:
+
+        *dx = 1;
+        *dy = -1;
+        *direction = DIR_RU;
+
+        return true;
+
+    // 左下
+    case CMD_LEFT_DOWN:
+
+        *dx = -1;
+        *dy = 1;
+        *direction = DIR_LD;
+
+        return true;
+
+    // 左上
+    case CMD_LEFT_UP:
+
+        *dx = -1;
+        *dy = -1;
+        *direction = DIR_LU;
+
+        return true;
+
+    default:
+
+        *direction = DIR_NONE;
+
+        return false;
+    }
+}
+
+
+// ========================================
 // 赤外線受信コールバック
 // ========================================
 
@@ -175,7 +305,7 @@ static void ir_received(
         return;
     }
 
-    // アドレス確認
+    // リモコンアドレス確認
     if(msg->address != REMOTE_ADDRESS) {
         return;
     }
@@ -185,67 +315,94 @@ static void ir_received(
         return;
     }
 
-    // 現在のマウス速度
-    uint8_t speed = app->mouse_speed;
+    // ------------------------------------
+    // 方向コマンド判定
+    // ------------------------------------
+
+    int8_t dx = 0;
+    int8_t dy = 0;
+
+    uint8_t direction = DIR_NONE;
+
+    if(ir_mouse_get_direction(
+        msg->command,
+        &dx,
+        &dy,
+        &direction)) {
+
+        uint8_t base_speed = app->mouse_speed;
+
+        // --------------------------------
+        // 加速処理
+        // --------------------------------
+
+        if(
+            msg->repeat &&
+            app->last_direction == direction
+        ) {
+
+            // 同じ方向の長押しなら加速
+            if(
+                app->accelerated_speed <
+                MOUSE_ACCEL_MAX
+            ) {
+
+                app->accelerated_speed +=
+                    MOUSE_ACCEL_STEP;
+
+                if(
+                    app->accelerated_speed >
+                    MOUSE_ACCEL_MAX
+                ) {
+
+                    app->accelerated_speed =
+                        MOUSE_ACCEL_MAX;
+                }
+            }
+
+        } else {
+
+            // 新しい方向なら基本速度に戻す
+            app->accelerated_speed = base_speed;
+        }
+
+        app->last_direction = direction;
+
+        // --------------------------------
+        // マウス移動
+        // --------------------------------
+
+        int8_t move_x =
+            (int8_t)(dx * app->accelerated_speed);
+
+        int8_t move_y =
+            (int8_t)(dy * app->accelerated_speed);
+
+        furi_hal_hid_mouse_move(
+            move_x,
+            move_y
+        );
+
+        return;
+    }
+
+
+    // ------------------------------------
+    // 方向以外の操作では加速をリセット
+    // ------------------------------------
+
+    app->last_direction = DIR_NONE;
+
+    app->accelerated_speed = app->mouse_speed;
+
+
+    // ------------------------------------
+    // クリック・スクロール
+    // ------------------------------------
 
     switch(msg->command) {
 
-    case CMD_UP:
-    case CMD_ALT_UP:
-
-        furi_hal_hid_mouse_move(0, -(int8_t)speed);
-
-        break;
-
-    case CMD_DOWN:
-    case CMD_ALT_DOWN:
-
-        furi_hal_hid_mouse_move(0, (int8_t)speed);
-
-        break;
-
-    case CMD_LEFT:
-    case CMD_ALT_LEFT:
-
-        furi_hal_hid_mouse_move(-(int8_t)speed, 0);
-
-        break;
-
-    case CMD_RIGHT:
-    case CMD_ALT_RIGHT:
-
-        furi_hal_hid_mouse_move((int8_t)speed, 0);
-
-        break;
-
-
-    case CMD_RIGHT_DOWN:
-
-        furi_hal_hid_mouse_move((int8_t)speed, (int8_t)speed);
-
-        break;
-
-    
-    case CMD_RIGHT_UP:
-
-        furi_hal_hid_mouse_move((int8_t)speed, -(int8_t)speed);
-
-        break;
-
-
-    case CMD_LEFT_DOWN:
-
-        furi_hal_hid_mouse_move(-(int8_t)speed, (int8_t)speed);
-
-        break;
-
-    
-    case CMD_LEFT_UP:
-
-        furi_hal_hid_mouse_move(-(int8_t)speed, -(int8_t)speed);
-
-        break;
-
+    // 左クリック
     case CMD_OK:
     case CMD_LEFT_CLICK:
 
@@ -264,6 +421,43 @@ static void ir_received(
         }
 
         break;
+
+
+    // 右クリック
+    case CMD_RIGHT_CLICK:
+
+        // リピート信号ではクリックしない
+        if(!msg->repeat) {
+
+            furi_hal_hid_mouse_press(
+                HID_MOUSE_BTN_RIGHT
+            );
+
+            furi_delay_ms(40);
+
+            furi_hal_hid_mouse_release(
+                HID_MOUSE_BTN_RIGHT
+            );
+        }
+
+        break;
+
+
+    // スクロール上
+    case CMD_SCR_UP:
+
+        furi_hal_hid_mouse_scroll(1);
+
+        break;
+
+
+    // スクロール下
+    case CMD_SCR_DOWN:
+
+        furi_hal_hid_mouse_scroll(-1);
+
+        break;
+
 
     default:
         break;
@@ -309,9 +503,11 @@ int32_t ir_mouse_app(void* p) {
     IRMouseApp app = {
         .running = true,
         .mouse_speed = MOUSE_SPEED_DEFAULT,
+        .accelerated_speed = MOUSE_SPEED_DEFAULT,
+        .last_direction = DIR_NONE,
     };
 
-    FURI_LOG_I(TAG, "Starting IR Mouse v2.0");
+    FURI_LOG_I(TAG, "Starting IR Mouse v3.0");
 
 
     // ------------------------------------
@@ -391,10 +587,8 @@ int32_t ir_mouse_app(void* p) {
 
     while(app.running) {
 
-        // 画面更新
         view_port_update(view_port);
 
-        // CPU負荷を抑える
         furi_delay_ms(100);
     }
 
@@ -436,7 +630,7 @@ int32_t ir_mouse_app(void* p) {
 
     ir_mouse_restore_usb();
 
-    FURI_LOG_I(TAG, "IR Mouse stopped");
+    FURI_LOG_I(TAG, "IR Mouse v3.0 stopped");
 
     return 0;
 }
