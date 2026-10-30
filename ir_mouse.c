@@ -36,6 +36,9 @@
 #define CMD_SCR_UP      0x0000B748
 #define CMD_SCR_DOWN    0x0000BB44
 
+#define CMD_BROWSER_BACK     0x0000B649
+#define CMD_BROWSER_FORWARD  0x0000B54A
+
 // 基本マウス速度
 #define MOUSE_SPEED_MIN      4
 #define MOUSE_SPEED_MAX      24
@@ -278,6 +281,37 @@ static bool ir_mouse_get_direction(
     }
 }
 
+// ========================================
+// ブラウザ戻る・進む
+// ========================================
+
+// ブラウザの戻る（Alt + Left）
+static void ir_mouse_browser_back(void) {
+
+    // HID Usage ID 0x50 = Left Arrow
+    uint16_t key = 0x0050 | KEY_MOD_LEFT_ALT;
+
+    furi_hal_hid_kb_press(key);
+
+    furi_delay_ms(50);
+
+    furi_hal_hid_kb_release(key);
+}
+
+
+// ブラウザの進む（Alt + Right）
+static void ir_mouse_browser_forward(void) {
+
+    // HID Usage ID 0x4F = Right Arrow
+    uint16_t key = 0x004F | KEY_MOD_LEFT_ALT;
+
+    furi_hal_hid_kb_press(key);
+
+    furi_delay_ms(50);
+
+    furi_hal_hid_kb_release(key);
+}
+
 
 // ========================================
 // 赤外線受信コールバック
@@ -458,6 +492,34 @@ static void ir_received(
 
         break;
 
+    // ------------------------------------
+    // ブラウザ戻る
+    // ------------------------------------
+
+    case CMD_BROWSER_BACK:
+
+        if(!msg->repeat) {
+            ir_mouse_browser_back();
+
+            FURI_LOG_I(TAG, "Browser Back");
+        }
+
+        break;
+
+
+    // ------------------------------------
+    // ブラウザ進む
+    // ------------------------------------
+
+    case CMD_BROWSER_FORWARD:
+
+        if(!msg->repeat) {
+            ir_mouse_browser_forward();
+
+            FURI_LOG_I(TAG, "Browser Forward");
+        }
+
+        break;
 
     default:
         break;
@@ -470,6 +532,9 @@ static void ir_received(
 // ========================================
 
 static void ir_mouse_restore_usb(void) {
+
+    // キーボードの押下状態を解除
+    furi_hal_hid_kb_release_all();
 
     // マウスボタンを解放
     furi_hal_hid_mouse_release(0);
