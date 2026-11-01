@@ -572,6 +572,16 @@ static void ir_received(
             ir_mouse_browser_forward();
             break;
 
+        case CMD_RIGHT_CLICK:
+            // 入力中の文字を即時確定
+            ir_mouse_commit_pending(app);
+            break;
+
+        case CMD_BKSP:
+            // PCへバックスペースを送信
+            ir_mouse_text_backspace();
+    break;
+
         default:
             break;
         }
