@@ -2,7 +2,7 @@
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_hid.h>
 #include <infrared_worker.h>
-
+#include <furi/core/kernel.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <gui/canvas.h>
@@ -38,6 +38,23 @@
 
 #define CMD_BROWSER_BACK     0x0000B649
 #define CMD_BROWSER_FORWARD  0x0000B54A
+
+// 数字ボタン（テキスト入力モード用）
+#define CMD_MENU       0x0000F10E
+#define CMD_NUM_0      0x0000EC13
+#define CMD_NUM_1      0x0000E51A
+#define CMD_NUM_2      0x0000E01F
+#define CMD_NUM_3      0x0000A758
+#define CMD_NUM_4      0x0000E916
+#define CMD_NUM_5      0x0000E41B
+#define CMD_NUM_6      0x0000AB54
+#define CMD_NUM_7      0x0000ED12
+#define CMD_NUM_8      0x0000E817
+#define CMD_NUM_9      0x0000AF50
+
+#define CMD_BKSP       0x0000E718
+
+#define TEXT_MULTITAP_TIMEOUT_MS 1000
 
 // 基本マウス速度
 #define MOUSE_SPEED_MIN      4
@@ -75,6 +92,15 @@ typedef struct {
     uint8_t accelerated_speed;
     uint8_t last_direction;
 
+    // テキスト入力モード
+    volatile bool text_mode;
+    volatile bool pending_valid;
+    volatile uint8_t pending_digit;
+    volatile uint8_t pending_index;
+    volatile uint32_t pending_tick;
+    volatile bool uppercase;
+    volatile bool number_mode;
+
 } IRMouseApp;
 
 
@@ -86,7 +112,7 @@ static const FuriHalUsbHidConfig hid_config = {
     .vid = 0x0483,
     .pid = 0x5740,
     .manuf = "Flipper Devices Inc.",
-    .product = "Flipper IR Mouse v3.0",
+    .product = "Flipper IR Mouse v4.0",
 };
 
 
@@ -103,29 +129,54 @@ static void ir_mouse_draw_callback(
     canvas_clear(canvas);
 
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 12, 12, "IR Mouse v3.0");
+    canvas_draw_str(canvas, 12, 12, "IR Mouse v4.0");
 
     canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 5, 24, "USB: HID Connected");
 
-    canvas_draw_str(canvas, 5, 25, "USB: HID Connected");
+    if(app->text_mode) {
+        canvas_draw_str(canvas, 5, 36, "MODE: TEXT INPUT");
 
-    char speed_text[32];
+        char preview[32];
+        if(app->pending_valid) {
+            const char* chars[] = {
+                " 0", ".,?!1", "abc", "def", "ghi",
+                "jkl", "mno", "pqrs", "tuv", "wxyz"
+            };
+            char ch = chars[app->pending_digit][app->pending_index];
 
-    snprintf(
-        speed_text,
-        sizeof(speed_text),
-        "Mouse Speed: %d px",
-        app->mouse_speed
-    );
+            if(app->number_mode) {
+                snprintf(preview, sizeof(preview), "Next: %c", (char)('0' + app->pending_digit));
+            } else if(ch == ' ') {
+                snprintf(preview, sizeof(preview), "Next: [SPACE]");
+            } else {
+                if(app->uppercase && ch >= 'a' && ch <= 'z') ch = (char)(ch - ('a' - 'A'));
+                snprintf(preview, sizeof(preview), "Next: %c", ch);
+            }
+        } else {
+            snprintf(preview, sizeof(preview), "Next: -");
+        }
 
-    canvas_draw_str(canvas, 5, 38, speed_text);
+        canvas_draw_str(canvas, 5, 47, preview);
 
-    canvas_draw_str(canvas, 5, 49, "Hold: Accelerates");
-
-    canvas_draw_str(canvas, 5, 59, "LEFT: Slower");
-
-    canvas_draw_str(canvas, 5, 67, "RIGHT: Faster");
+        if(app->number_mode) {
+            canvas_draw_str(canvas, 5, 56, "DOWN: ABC  OK: Enter");
+        } else {
+            canvas_draw_str(canvas, 5, 56, app->uppercase ? "UP: lower  DOWN: 123" : "UP: UPPER  DOWN: 123");
+        }
+        canvas_draw_str(canvas, 5, 63, "OK: Enter  L: Del  R: Space");
+    } else {
+        char speed_text[32];
+        snprintf(speed_text, sizeof(speed_text), "Mouse Speed: %d px", app->mouse_speed);
+        canvas_draw_str(canvas, 5, 38, speed_text);
+        canvas_draw_str(canvas, 5, 50, "Hold: Accelerates");
+        canvas_draw_str(canvas, 5, 61, "L/R: Speed  MENU: Text");
+    }
 }
+
+
+// テキスト入力補助関数（定義は後方）
+static void ir_mouse_commit_pending(IRMouseApp* app);
 
 
 // ========================================
@@ -146,9 +197,14 @@ static void ir_mouse_input_callback(
 
     case InputKeyBack:
 
-        FURI_LOG_I(TAG, "Exit requested");
-
-        app->running = false;
+        if(app->text_mode) {
+            ir_mouse_commit_pending(app);
+            app->text_mode = false;
+            FURI_LOG_I(TAG, "Returned to mouse mode");
+        } else {
+            FURI_LOG_I(TAG, "Exit requested");
+            app->running = false;
+        }
 
         break;
 
@@ -314,6 +370,110 @@ static void ir_mouse_browser_forward(void) {
 
 
 // ========================================
+// テキスト入力（英字マルチタップ）
+// ========================================
+
+static const char* const text_multitap_chars[10] = {
+    " 0",       // 0
+    ".,?!1",    // 1
+    "abc",      // 2
+    "def",      // 3
+    "ghi",      // 4
+    "jkl",      // 5
+    "mno",      // 6
+    "pqrs",     // 7
+    "tuv",      // 8
+    "wxyz"      // 9
+};
+
+static void ir_mouse_send_ascii(char ch) {
+    uint16_t key = HID_ASCII_TO_KEY(ch);
+    if(key == HID_KEYBOARD_NONE) return;
+
+    furi_hal_hid_kb_press(key);
+    furi_delay_ms(12);
+    furi_hal_hid_kb_release(key);
+    furi_delay_ms(12);
+}
+
+static char ir_mouse_pending_char(IRMouseApp* app) {
+    const char* chars = text_multitap_chars[app->pending_digit];
+    char ch = chars[app->pending_index];
+
+    if(app->uppercase && ch >= 'a' && ch <= 'z') {
+        ch = (char)(ch - ('a' - 'A'));
+    }
+
+    return ch;
+}
+
+static void ir_mouse_commit_pending(IRMouseApp* app) {
+    if(!app->pending_valid) return;
+
+    char ch = ir_mouse_pending_char(app);
+    ir_mouse_send_ascii(ch);
+    app->pending_valid = false;
+}
+
+static void ir_mouse_text_digit(IRMouseApp* app, uint8_t digit) {
+    if(digit > 9) return;
+
+    // 数字モードでは押した数字をそのまま送信
+    if(app->number_mode) {
+        ir_mouse_commit_pending(app);
+        ir_mouse_send_ascii((char)('0' + digit));
+        return;
+    }
+
+    uint32_t now = furi_get_tick();
+    uint32_t timeout = furi_ms_to_ticks(TEXT_MULTITAP_TIMEOUT_MS);
+
+    if(app->pending_valid &&
+       app->pending_digit == digit &&
+       (uint32_t)(now - app->pending_tick) <= timeout) {
+
+        const char* chars = text_multitap_chars[digit];
+        uint8_t length = 0;
+        while(chars[length] != '\0') length++;
+
+        app->pending_index = (uint8_t)((app->pending_index + 1) % length);
+        app->pending_tick = now;
+    } else {
+        ir_mouse_commit_pending(app);
+        app->pending_digit = digit;
+        app->pending_index = 0;
+        app->pending_tick = now;
+        app->pending_valid = true;
+    }
+}
+
+static void ir_mouse_text_backspace(void) {
+    // HID Usage 0x2A = Keyboard Backspace
+    const uint16_t key = 0x002A;
+    furi_hal_hid_kb_press(key);
+    furi_delay_ms(12);
+    furi_hal_hid_kb_release(key);
+    furi_delay_ms(12);
+}
+
+static bool ir_mouse_get_digit(uint32_t command, uint8_t* digit) {
+    switch(command) {
+    case CMD_NUM_0: *digit = 0; return true;
+    case CMD_NUM_1: *digit = 1; return true;
+    case CMD_NUM_2: *digit = 2; return true;
+    case CMD_NUM_3: *digit = 3; return true;
+    case CMD_NUM_4: *digit = 4; return true;
+    case CMD_NUM_5: *digit = 5; return true;
+    case CMD_NUM_6: *digit = 6; return true;
+    case CMD_NUM_7: *digit = 7; return true;
+    case CMD_NUM_8: *digit = 8; return true;
+    case CMD_NUM_9: *digit = 9; return true;
+    default: return false;
+    }
+}
+
+
+// ========================================
 // 赤外線受信コールバック
 // ========================================
 
@@ -346,6 +506,76 @@ static void ir_received(
 
     // USB接続確認
     if(!furi_hal_hid_is_connected()) {
+        return;
+    }
+
+    // MENUでマウスモード／テキスト入力モードを切り替え
+    if(msg->command == CMD_MENU && !msg->repeat) {
+        if(app->text_mode) {
+            ir_mouse_commit_pending(app);
+            app->text_mode = false;
+            FURI_LOG_I(TAG, "Mouse mode");
+        } else {
+            app->pending_valid = false;
+            app->uppercase = false;
+            app->number_mode = false;
+            app->text_mode = true;
+            FURI_LOG_I(TAG, "Text input mode");
+        }
+        app->last_direction = DIR_NONE;
+        app->accelerated_speed = app->mouse_speed;
+        return;
+    }
+
+    // テキスト入力モード
+    if(app->text_mode) {
+        uint8_t digit = 0;
+
+        // 数字コマンドは既存の斜め移動コマンドと値が重なるため、
+        // テキストモードでは最初に数字として判定する。
+        if(!msg->repeat && ir_mouse_get_digit(msg->command, &digit)) {
+            ir_mouse_text_digit(app, digit);
+            return;
+        }
+
+        if(msg->repeat) return;
+
+        switch(msg->command) {
+        case CMD_OK:
+            ir_mouse_commit_pending(app);
+            break;
+
+        case CMD_LEFT:
+            ir_mouse_commit_pending(app);
+            ir_mouse_text_backspace();
+            break;
+
+        case CMD_RIGHT:
+            ir_mouse_commit_pending(app);
+            ir_mouse_send_ascii(' ');
+            break;
+
+        case CMD_UP:
+            app->uppercase = !app->uppercase;
+            break;
+
+        case CMD_DOWN:
+            ir_mouse_commit_pending(app);
+            app->number_mode = !app->number_mode;
+            break;
+
+        case CMD_BROWSER_BACK:
+            ir_mouse_browser_back();
+            break;
+
+        case CMD_BROWSER_FORWARD:
+            ir_mouse_browser_forward();
+            break;
+
+        default:
+            break;
+        }
+
         return;
     }
 
@@ -570,9 +800,16 @@ int32_t ir_mouse_app(void* p) {
         .mouse_speed = MOUSE_SPEED_DEFAULT,
         .accelerated_speed = MOUSE_SPEED_DEFAULT,
         .last_direction = DIR_NONE,
+        .text_mode = false,
+        .pending_valid = false,
+        .pending_digit = 0,
+        .pending_index = 0,
+        .pending_tick = 0,
+        .uppercase = false,
+        .number_mode = false,
     };
 
-    FURI_LOG_I(TAG, "Starting IR Mouse v3.0");
+    FURI_LOG_I(TAG, "Starting IR Mouse v4.0");
 
 
     // ------------------------------------
@@ -652,9 +889,19 @@ int32_t ir_mouse_app(void* p) {
 
     while(app.running) {
 
+        // マルチタップ文字は約1秒入力がなければ自動確定
+        if(app.text_mode && app.pending_valid) {
+            uint32_t now = furi_get_tick();
+            uint32_t timeout = furi_ms_to_ticks(TEXT_MULTITAP_TIMEOUT_MS);
+
+            if((uint32_t)(now - app.pending_tick) > timeout) {
+                ir_mouse_commit_pending(&app);
+            }
+        }
+
         view_port_update(view_port);
 
-        furi_delay_ms(100);
+        furi_delay_ms(50);
     }
 
 
@@ -695,7 +942,7 @@ int32_t ir_mouse_app(void* p) {
 
     ir_mouse_restore_usb();
 
-    FURI_LOG_I(TAG, "IR Mouse v3.0 stopped");
+    FURI_LOG_I(TAG, "IR Mouse v4.0 stopped");
 
     return 0;
 }
