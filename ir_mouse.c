@@ -573,8 +573,16 @@ static void ir_received(
             break;
 
         case CMD_RIGHT_CLICK:
-            // 入力中の文字を即時確定
-            ir_mouse_commit_pending(app);
+            if(app->pending_valid) {
+                // 入力中の文字があれば即時確定
+                ir_mouse_commit_pending(app);
+            } else {
+                // 入力中の文字がなければEnterを送信
+                uint16_t key = 0x0028; // HID Enter
+                furi_hal_hid_kb_press(key);
+                furi_delay_ms(50);
+                furi_hal_hid_kb_release(key);
+            }
             break;
 
         case CMD_BKSP:
